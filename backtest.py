@@ -8,15 +8,27 @@ import pandas as pd
 
 
 STRATEGY_LABELS = {
-    "buy_below": "Acheter au croisement sous la SMA",
-    "buy_above": "Acheter au croisement au-dessus de la SMA",
+    "cross_below": "Croisement sous la SMA",
+    "cross_above": "Croisement au-dessus de la SMA",
 }
+
+HORIZONS = (
+    ("10 jours", "sessions", 10),
+    ("25 jours", "sessions", 25),
+    ("50 jours", "sessions", 50),
+    ("100 jours", "sessions", 100),
+    ("200 jours", "sessions", 200),
+    ("1 an", "years", 1),
+    ("2 ans", "years", 2),
+    ("3 ans", "years", 3),
+    ("5 ans", "years", 5),
+    ("10 ans", "years", 10),
+)
+HORIZON_ORDER = [label for label, _, _ in HORIZONS]
 
 
 @dataclass(frozen=True)
-class BacktestConfig:
-    initial_capital: float = 10_000.0
-    cost_bps: float = 2.0
+class StudyConfig:
     cooldown_days: int = 30
 
 
@@ -30,8 +42,7 @@ def normalize_ohlc(data: pd.DataFrame, ticker: str | None = None) -> pd.DataFram
             frame.columns = frame.columns.get_level_values(0)
 
     frame.columns = [str(col).title() for col in frame.columns]
-    required = {"Open", "Close"}
-    if not required.issubset(frame.columns):
+    if not {"Open", "Close"}.issubset(frame.columns):
         raise ValueError("Les données doivent contenir les colonnes Open et Close.")
 
     frame = frame[["Open", "Close"]].apply(pd.to_numeric, errors="coerce")
@@ -42,166 +53,181 @@ def normalize_ohlc(data: pd.DataFrame, ticker: str | None = None) -> pd.DataFram
     return frame
 
 
-def _state_from_crosses(
+def _candidate_signals(
     close: pd.Series,
     sma: pd.Series,
     strategy: str,
-    active_from: str | pd.Timestamp | None = None,
-    cooldown_days: int = 0,
 ) -> pd.Series:
     above = close > sma
-    cross_above = above & ~above.shift(1, fill_value=False)
-    cross_below = ~above & above.shift(1, fill_value=False) & sma.notna()
-
-    if strategy == "buy_above":
-        entries, exits = cross_above & sma.notna(), cross_below
-    elif strategy == "buy_below":
-        entries, exits = cross_below, cross_above & sma.notna()
-    else:
-        raise ValueError(f"Stratégie inconnue : {strategy}")
-
-    if active_from is not None:
-        active = close.index >= pd.Timestamp(active_from)
-        entries &= active
-        exits &= active
-
-    state = pd.Series(0.0, index=close.index, dtype=float)
-    holding = False
-    last_entry: pd.Timestamp | None = None
-
-    for date in close.index:
-        if holding and bool(exits.at[date]):
-            holding = False
-        elif not holding and bool(entries.at[date]):
-            cooldown_complete = (
-                last_entry is None
-                or (pd.Timestamp(date) - last_entry).days >= cooldown_days
-            )
-            if cooldown_complete:
-                holding = True
-                last_entry = pd.Timestamp(date)
-        state.at[date] = float(holding)
-
-    return state
+    previous_above = above.shift(1, fill_value=False)
+    if strategy == "cross_above":
+        return above & ~previous_above & sma.notna()
+    if strategy == "cross_below":
+        return ~above & previous_above & sma.notna()
+    raise ValueError(f"Stratégie inconnue : {strategy}")
 
 
-def equity_curve(
+def signal_dates(
     data: pd.DataFrame,
     sma_window: int,
     strategy: str,
-    config: BacktestConfig = BacktestConfig(),
-    active_from: str | pd.Timestamp | None = None,
-) -> pd.DataFrame:
-    """Backtest close signals executed at the following session's adjusted open."""
+    active_from: str | pd.Timestamp,
+    cooldown_days: int = 30,
+) -> pd.DatetimeIndex:
+    """Find close signals and suppress later signals during the calendar cooldown."""
     frame = normalize_ohlc(data)
-    frame["SMA"] = frame["Close"].rolling(sma_window, min_periods=sma_window).mean()
-    state_at_close = _state_from_crosses(
-        frame["Close"],
-        frame["SMA"],
-        strategy,
-        active_from=active_from,
-        cooldown_days=config.cooldown_days,
-    )
+    sma = frame["Close"].rolling(sma_window, min_periods=sma_window).mean()
+    candidates = _candidate_signals(frame["Close"], sma, strategy)
+    candidates &= frame.index >= pd.Timestamp(active_from)
 
-    # A close signal on day t changes the position at open t+1. Open-to-open
-    # return ending on t is therefore earned from the state known at close t-2.
-    frame["Position"] = state_at_close.shift(1, fill_value=0.0)
-    interval_position = state_at_close.shift(2, fill_value=0.0)
-    frame["MarketReturn"] = frame["Open"].pct_change().fillna(0.0)
-    frame["StrategyReturn"] = interval_position * frame["MarketReturn"]
-
-    transaction = frame["Position"].diff().abs().fillna(frame["Position"].abs())
-    frame["StrategyReturn"] -= transaction * (config.cost_bps / 10_000.0)
-    frame["Equity"] = config.initial_capital * (1.0 + frame["StrategyReturn"]).cumprod()
-
-    if active_from is not None:
-        frame = frame.loc[frame.index >= pd.Timestamp(active_from)].copy()
-        if frame.empty:
-            raise ValueError("La période demandée ne contient aucune séance.")
-
-    frame["Benchmark"] = config.initial_capital * (
-        frame["Close"] / frame["Close"].iloc[0]
-    )
-    return frame
+    accepted: list[pd.Timestamp] = []
+    last_signal: pd.Timestamp | None = None
+    for date in frame.index[candidates]:
+        date = pd.Timestamp(date)
+        if last_signal is None or (date - last_signal).days >= cooldown_days:
+            accepted.append(date)
+            last_signal = date
+    return pd.DatetimeIndex(accepted)
 
 
-def _trade_returns(curve: pd.DataFrame, cost_bps: float) -> list[float]:
-    changes = curve["Position"].diff().fillna(curve["Position"])
-    entry_dates = list(changes.index[changes > 0])
-    exit_dates = list(changes.index[changes < 0])
-    returns: list[float] = []
+def _target_location(
+    index: pd.DatetimeIndex,
+    entry_location: int,
+    entry_date: pd.Timestamp,
+    horizon_type: str,
+    horizon_value: int,
+) -> int | None:
+    if horizon_type == "sessions":
+        location = entry_location + horizon_value
+        return location if location < len(index) else None
 
-    for entry_date in entry_dates:
-        later_exits = [date for date in exit_dates if date > entry_date]
-        if later_exits:
-            exit_date = later_exits[0]
-            exit_price = curve.at[exit_date, "Open"]
-        else:
-            exit_price = curve["Close"].iloc[-1]
-        entry_price = curve.at[entry_date, "Open"]
-        gross = exit_price / entry_price - 1.0
-        returns.append(gross - 2.0 * cost_bps / 10_000.0)
-    return returns
+    target_date = entry_date + pd.DateOffset(years=horizon_value)
+    location = int(index.searchsorted(target_date, side="left"))
+    return location if location < len(index) else None
 
 
-def summarize_curve(
-    curve: pd.DataFrame,
+def event_returns(
+    data: pd.DataFrame,
     sma_window: int,
     strategy: str,
+    active_from: str | pd.Timestamp,
     period_label: str,
-    config: BacktestConfig,
-) -> dict[str, float | int | str]:
-    equity = curve["Equity"]
-    years = max((curve.index[-1] - curve.index[0]).days / 365.25, 1 / 365.25)
-    total_return = equity.iloc[-1] / config.initial_capital - 1.0
-    cagr = (equity.iloc[-1] / config.initial_capital) ** (1.0 / years) - 1.0
-    drawdown = equity / equity.cummax() - 1.0
-    trades = _trade_returns(curve, config.cost_bps)
-    benchmark_return = curve["Benchmark"].iloc[-1] / config.initial_capital - 1.0
-    benchmark_cagr = (1.0 + benchmark_return) ** (1.0 / years) - 1.0
+    config: StudyConfig = StudyConfig(),
+) -> pd.DataFrame:
+    """Measure adjusted returns after each accepted signal; no exit rule is used."""
+    frame = normalize_ohlc(data)
+    signals = signal_dates(
+        frame, sma_window, strategy, active_from, config.cooldown_days
+    )
+    rows: list[dict[str, object]] = []
 
-    return {
-        "Période": period_label,
-        "Stratégie": STRATEGY_LABELS[strategy],
-        "Code stratégie": strategy,
-        "SMA": sma_window,
-        "Rendement total": total_return,
-        "Rendement annualisé": cagr,
-        "Rendement achat-conservation": benchmark_return,
-        "Rendement annualisé achat-conservation": benchmark_cagr,
-        "Surperformance": total_return - benchmark_return,
-        "Surperformance annualisée": cagr - benchmark_cagr,
-        "Drawdown maximal": drawdown.min(),
-        "Transactions": len(trades),
-        "Taux de réussite": float(np.mean(np.array(trades) > 0)) if trades else np.nan,
-        "Exposition": curve["Position"].mean(),
-        "Capital final": equity.iloc[-1],
-    }
+    for signal_date in signals:
+        signal_location = int(frame.index.get_loc(signal_date))
+        entry_location = signal_location + 1
+        if entry_location >= len(frame):
+            continue
+        entry_date = pd.Timestamp(frame.index[entry_location])
+        entry_price = float(frame["Open"].iloc[entry_location])
+
+        for horizon_label, horizon_type, horizon_value in HORIZONS:
+            target_location = _target_location(
+                frame.index,
+                entry_location,
+                entry_date,
+                horizon_type,
+                horizon_value,
+            )
+            if target_location is None:
+                continue
+            observation_date = pd.Timestamp(frame.index[target_location])
+            observation_price = float(frame["Close"].iloc[target_location])
+            rows.append(
+                {
+                    "Période": period_label,
+                    "Stratégie": STRATEGY_LABELS[strategy],
+                    "Code stratégie": strategy,
+                    "SMA": sma_window,
+                    "Date du signal": signal_date,
+                    "Date d'entrée": entry_date,
+                    "Prix d'entrée": entry_price,
+                    "Horizon": horizon_label,
+                    "Date d'observation": observation_date,
+                    "Prix d'observation": observation_price,
+                    "Rendement": observation_price / entry_price - 1.0,
+                }
+            )
+    return pd.DataFrame(rows)
 
 
-def run_sma_sweep(
+def run_event_study(
     data: pd.DataFrame,
     periods: dict[str, str],
     sma_windows: Iterable[int] = range(150, 251),
-    strategies: Iterable[str] = ("buy_below", "buy_above"),
-    config: BacktestConfig = BacktestConfig(),
+    strategies: Iterable[str] = ("cross_below", "cross_above"),
+    config: StudyConfig = StudyConfig(),
 ) -> pd.DataFrame:
     frame = normalize_ohlc(data)
-    rows: list[dict[str, float | int | str]] = []
     windows = list(sma_windows)
+    all_events: list[pd.DataFrame] = []
 
     for period_label, start_date in periods.items():
-        sample = frame.loc[frame.index >= pd.Timestamp(start_date)]
         warmup = frame.loc[frame.index < pd.Timestamp(start_date)]
-        if len(sample) <= 2 or len(warmup) < max(windows):
+        if len(warmup) < max(windows):
             continue
         for strategy in strategies:
             for window in windows:
-                curve = equity_curve(
-                    frame, window, strategy, config, active_from=start_date
+                events = event_returns(
+                    frame,
+                    window,
+                    strategy,
+                    start_date,
+                    period_label,
+                    config,
                 )
-                rows.append(summarize_curve(curve, window, strategy, period_label, config))
+                if not events.empty:
+                    all_events.append(events)
 
-    if not rows:
-        raise ValueError("Il n'y a pas assez de données pour les périodes et SMA choisies.")
-    return pd.DataFrame(rows)
+    if not all_events:
+        raise ValueError("Aucun signal exploitable n'a été trouvé.")
+    result = pd.concat(all_events, ignore_index=True)
+    result["Horizon"] = pd.Categorical(
+        result["Horizon"], categories=HORIZON_ORDER, ordered=True
+    )
+    return result
+
+
+def summarize_events(events: pd.DataFrame) -> pd.DataFrame:
+    if events.empty:
+        return pd.DataFrame()
+    summary = (
+        events.groupby(
+            ["Période", "Stratégie", "Code stratégie", "SMA", "Horizon"],
+            observed=True,
+        )["Rendement"]
+        .agg(
+            Observations="count",
+            **{
+                "Rendement moyen": "mean",
+                "Rendement médian": "median",
+                "Meilleur rendement": "max",
+                "Pire rendement": "min",
+                "Écart-type": "std",
+            },
+        )
+        .reset_index()
+    )
+    win_rate = (
+        events.assign(Gagnant=events["Rendement"] > 0)
+        .groupby(
+            ["Période", "Stratégie", "Code stratégie", "SMA", "Horizon"],
+            observed=True,
+        )["Gagnant"]
+        .mean()
+        .rename("Taux positif")
+        .reset_index()
+    )
+    return summary.merge(
+        win_rate,
+        on=["Période", "Stratégie", "Code stratégie", "SMA", "Horizon"],
+    )
+
