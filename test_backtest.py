@@ -3,15 +3,23 @@ import unittest
 import numpy as np
 import pandas as pd
 
-from backtest import BacktestConfig, equity_curve, normalize_ohlc, run_sma_sweep
+from backtest import (
+    HORIZON_ORDER,
+    StudyConfig,
+    event_returns,
+    normalize_ohlc,
+    run_event_study,
+    signal_dates,
+    summarize_events,
+)
 
 
-class BacktestTests(unittest.TestCase):
+class EventStudyTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        dates = pd.bdate_range("2018-01-01", periods=1_400)
-        trend = np.linspace(50, 130, len(dates))
-        wave = 14 * np.sin(np.arange(len(dates)) / 25)
+        dates = pd.bdate_range("2008-01-01", periods=4_600)
+        trend = np.linspace(50, 180, len(dates))
+        wave = 18 * np.sin(np.arange(len(dates)) / 24)
         close = trend + wave
         open_ = close * (1 + 0.001 * np.cos(np.arange(len(dates)) / 7))
         cls.data = pd.DataFrame({"Open": open_, "Close": close}, index=dates)
@@ -20,41 +28,49 @@ class BacktestTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             normalize_ohlc(pd.DataFrame({"Volume": [1, 2]}))
 
-    def test_curve_has_no_lookahead_entry(self):
-        curve = equity_curve(self.data, 150, "buy_above")
-        self.assertEqual(curve["Position"].iloc[:150].sum(), 0)
-        self.assertTrue((curve["Equity"] > 0).all())
-
-    def test_full_sweep_shape_and_metrics(self):
-        results = run_sma_sweep(
-            self.data,
-            {"Test": "2019-01-01"},
-            range(150, 153),
-            config=BacktestConfig(10_000, 2),
+    def test_signal_cooldown(self):
+        signals = signal_dates(
+            self.data, 150, "cross_above", "2010-01-01", cooldown_days=90
         )
-        self.assertEqual(len(results), 6)
-        self.assertEqual(set(results["SMA"]), {150, 151, 152})
-        self.assertTrue(results["Drawdown maximal"].le(0).all())
+        if len(signals) > 1:
+            gaps = pd.Series(signals[1:] - signals[:-1]).dt.days
+            self.assertTrue(gaps.ge(90).all())
 
-    def test_period_uses_prior_prices_as_sma_warmup(self):
-        curve = equity_curve(
-            self.data, 150, "buy_above", active_from="2019-01-01"
-        )
-        self.assertGreaterEqual(curve.index.min(), pd.Timestamp("2019-01-01"))
-        self.assertFalse(curve["SMA"].iloc[0:5].isna().any())
-
-    def test_entry_signals_respect_cooldown(self):
-        curve = equity_curve(
+    def test_entry_is_next_session(self):
+        events = event_returns(
             self.data,
             150,
-            "buy_above",
-            BacktestConfig(cooldown_days=90),
+            "cross_below",
+            "2010-01-01",
+            "Test",
+            StudyConfig(30),
         )
-        entries = curve.index[curve["Position"].diff().fillna(0) > 0]
-        if len(entries) > 1:
-            gaps = pd.Series(entries[1:] - entries[:-1]).dt.days
-            self.assertTrue(gaps.ge(90).all())
+        first = events.iloc[0]
+        signal_location = self.data.index.get_loc(first["Date du signal"])
+        self.assertEqual(first["Date d'entrée"], self.data.index[signal_location + 1])
+
+    def test_long_horizons_only_when_available(self):
+        events = event_returns(
+            self.data, 150, "cross_above", "2024-01-01", "Test"
+        )
+        if not events.empty:
+            late = events[events["Date d'entrée"] > self.data.index[-1] - pd.Timedelta(days=365)]
+            self.assertFalse((late["Horizon"].astype(str) == "1 an").any())
+
+    def test_study_and_summary(self):
+        events = run_event_study(
+            self.data,
+            {"Depuis 2010": "2010-01-01"},
+            range(150, 153),
+            config=StudyConfig(30),
+        )
+        summary = summarize_events(events)
+        self.assertFalse(events.empty)
+        self.assertFalse(summary.empty)
+        self.assertTrue(set(events["Horizon"].astype(str)).issubset(HORIZON_ORDER))
+        self.assertTrue(events["Rendement"].notna().all())
 
 
 if __name__ == "__main__":
     unittest.main()
+
